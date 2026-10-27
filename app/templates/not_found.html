@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Not found · APIWatch{% endblock %}
+{% block content %}
+<div class="panel">
+  <div class="empty">
+    <h3>Monitor #{{ monitor_id }} was not found</h3>
+    <p>It may have been deleted.</p>
+    <a class="btn" href="/">Back to dashboard</a>
+  </div>
+</div>
+{% endblock %}

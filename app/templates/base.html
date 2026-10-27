@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}APIWatch{% endblock %}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b82f6'/%3E%3Cpath d='M5 17h5l3-7 5 13 3-6h6' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ asset('css/style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 4.5 12 2.5-6H21"/></svg>
+        </span>
+        APIWatch
+      </a>
+      <nav class="nav">
+        <a href="/" class="{% block nav_dashboard %}{% endblock %}">Dashboard</a>
+        <a href="/docs" target="_blank" rel="noopener">API Docs</a>
+      </nav>
+      <div class="topbar-right">
+        <span class="refresh-indicator" title="Data refreshes automatically every 10 seconds">
+          <span class="live-dot"></span><span class="text" id="refresh-text">Live</span>
+        </span>
+        <button class="btn btn-primary" type="button" data-action="add-monitor">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          <span>Add monitor</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    {% if allow_localhost %}
+    <div class="banner" role="note">
+      <strong>Development mode.</strong>
+      <span>APIWATCH_ALLOW_LOCALHOST is enabled, so localhost targets can be monitored. Disable it outside local development.</span>
+    </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">APIWatch v{{ version }} &middot; single-user local monitoring &middot; <a href="/docs">REST API</a></footer>
+
+  <!-- Add / edit monitor modal -->
+  <div class="modal-backdrop" id="monitor-modal" aria-hidden="true">
+    <form class="modal" id="monitor-form" role="dialog" aria-modal="true" aria-labelledby="monitor-modal-title" novalidate>
+      <div class="modal-head">
+        <h2 id="monitor-modal-title">Add monitor</h2>
+        <button class="icon-btn" type="button" data-action="close-modal" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="field span-2" data-field="name">
+            <label for="f-name">Name</label>
+            <input id="f-name" name="name" type="text" maxlength="100" required placeholder="Payments API">
+            <div class="error"></div>
+          </div>
+          <div class="field span-2" data-field="url">
+            <label for="f-url">URL</label>
+            <input id="f-url" name="url" type="url" maxlength="2048" required placeholder="https://api.example.com/health">
+            <div class="help">http:// or https:// only. Private and internal addresses are blocked.</div>
+            <div class="error"></div>
+          </div>
+          <div class="field" data-field="method">
+            <label for="f-method">HTTP method</label>
+            <select id="f-method" name="method"><option>GET</option><option>HEAD</option></select>
+            <div class="error"></div>
+          </div>
+          <div class="field" data-field="expected_status">
+            <label for="f-status">Expected status code</label>
+            <input id="f-status" name="expected_status" type="number" min="100" max="599" value="200" required>
+            <div class="error"></div>
+          </div>
+          <div class="field" data-field="interval_seconds">
+            <label for="f-interval">Check interval (seconds)</label>
+            <input id="f-interval" name="interval_seconds" type="number" min="30" max="3600" value="60" required>
+            <div class="help">30 – 3600 seconds</div>
+            <div class="error"></div>
+          </div>
+          <div class="field" data-field="timeout_seconds">
+            <label for="f-timeout">Timeout (seconds)</label>
+            <input id="f-timeout" name="timeout_seconds" type="number" min="0.5" max="30" step="0.5" value="10" required>
+            <div class="error"></div>
+          </div>
+          <div class="field span-2" data-field="slow_threshold_ms">
+            <label for="f-slow">Slow response threshold (ms)</label>
+            <input id="f-slow" name="slow_threshold_ms" type="number" min="1" max="60000" value="1000" required>
+            <div class="help">Responses slower than this are marked DEGRADED.</div>
+            <div class="error"></div>
+          </div>
+          <label class="check-row field" data-field="enabled">
+            <span class="switch"><input type="checkbox" name="enabled" checked><span class="track"></span></span>
+            <span class="text">Enabled<small>Run checks automatically</small></span>
+          </label>
+          <label class="check-row field" data-field="inspect_json">
+            <span class="switch"><input type="checkbox" name="inspect_json"><span class="track"></span></span>
+            <span class="text">Inspect JSON<small>Detect top-level field changes (GET)</small></span>
+          </label>
+        </div>
+        <div class="form-error" id="form-error" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" type="button" data-action="close-modal">Cancel</button>
+        <button class="btn btn-primary" type="submit" id="monitor-submit">Save monitor</button>
+      </div>
+    </form>
+  </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <script src="{{ asset('js/chart.js') }}"></script>
+  <script src="{{ asset('js/common.js') }}"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · APIWatch{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>API Health Overview</h1>
+    <p>Availability and latency measured from stored checks.</p>
+  </div>
+  <div class="head-actions">
+    <div class="segmented" id="window-picker" role="tablist" aria-label="Time window">
+      <button type="button" data-window="24h" class="active">24 hours</button>
+      <button type="button" data-window="7d">7 days</button>
+      <button type="button" data-window="all">All data</button>
+    </div>
+  </div>
+</div>
+
+<section class="grid grid-cards" id="summary-cards" aria-label="Summary">
+  <div class="panel stat-card accent"><div class="label">Total APIs</div><div class="value" id="card-total">–</div><div class="hint" id="card-total-hint">&nbsp;</div></div>
+  <div class="panel stat-card up"><div class="label">Healthy</div><div class="value" id="card-up">–</div><div class="hint">Latest check UP</div></div>
+  <div class="panel stat-card degraded"><div class="label">Degraded</div><div class="value" id="card-degraded">–</div><div class="hint">Slower than threshold</div></div>
+  <div class="panel stat-card down"><div class="label">Down</div><div class="value" id="card-down">–</div><div class="hint" id="card-down-hint">&nbsp;</div></div>
+  <div class="panel stat-card accent"><div class="label">Overall uptime</div><div class="value" id="card-uptime">–</div><div class="hint" id="card-uptime-hint">&nbsp;</div></div>
+</section>
+
+<section class="panel mt">
+  <div class="panel-head">
+    <h2>Monitors</h2>
+    <span class="sub" id="monitor-count"></span>
+  </div>
+  <div class="panel-body flush">
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>API name</th>
+            <th class="hide-sm">Endpoint</th>
+            <th>Status</th>
+            <th class="num">Response</th>
+            <th class="hide-sm">Last checked</th>
+            <th class="num">Uptime 24h</th>
+            <th class="num">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="monitor-rows">
+          <tr><td colspan="7" class="empty">Loading monitors…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="grid grid-2-1 mt">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Response times</h2>
+      <span class="sub" id="chart-sub">Successful responses per monitor</span>
+    </div>
+    <div class="panel-body"><div class="chart" id="overview-chart"></div></div>
+    <div class="legend" id="overview-legend"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Incidents</h2>
+      <span class="sub" id="incident-sub" data-threshold="{{ incident_threshold }}"></span>
+    </div>
+    <div class="panel-body flush scroll-y"><ul class="list" id="incident-list"></ul></div>
+  </div>
+</section>
+
+<section class="panel mt">
+  <div class="panel-head">
+    <h2>Recent failed checks</h2>
+    <span class="sub">Latest DOWN results with error details</span>
+  </div>
+  <div class="panel-body flush">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>API</th><th>Category</th><th>Error</th><th class="num">HTTP</th></tr></thead>
+        <tbody id="failure-rows"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ asset('js/dashboard.js') }}"></script>{% endblock %}

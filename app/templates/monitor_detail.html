@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ monitor.name }} · APIWatch{% endblock %}
+{% block content %}
+<div class="crumbs"><a href="/">Dashboard</a> / Monitor #{{ monitor.id }}</div>
+<div class="page-head">
+  <div>
+    <div class="title-row">
+      <h1 id="monitor-name">{{ monitor.name }}</h1>
+      <span class="pill lg PENDING" id="monitor-status">…</span>
+    </div>
+    <p class="mono" id="monitor-url">{{ monitor.method }} {{ monitor.url }}</p>
+  </div>
+  <div class="head-actions">
+    <button class="btn" type="button" id="btn-check">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 4v5h-5"/></svg>
+      Run check
+    </button>
+    <button class="btn" type="button" id="btn-toggle">Disable</button>
+    <button class="btn" type="button" id="btn-edit">Edit</button>
+    <button class="btn btn-danger" type="button" id="btn-delete">Delete</button>
+  </div>
+</div>
+
+<div class="page-head" style="margin-bottom:14px">
+  <div class="faint" id="window-note">&nbsp;</div>
+  <div class="segmented" id="window-picker" role="tablist" aria-label="Time window">
+    <button type="button" data-window="24h" class="active">24 hours</button>
+    <button type="button" data-window="7d">7 days</button>
+    <button type="button" data-window="all">All data</button>
+  </div>
+</div>
+
+<section class="grid grid-cards">
+  <div class="panel stat-card accent"><div class="label">Uptime</div><div class="value" id="s-uptime">–</div><div class="hint" id="s-uptime-hint">&nbsp;</div></div>
+  <div class="panel stat-card accent"><div class="label">Avg response</div><div class="value" id="s-avg">–</div><div class="hint" id="s-minmax">&nbsp;</div></div>
+  <div class="panel stat-card up"><div class="label">Successful</div><div class="value" id="s-success">–</div><div class="hint">UP + DEGRADED</div></div>
+  <div class="panel stat-card down"><div class="label">Failed</div><div class="value" id="s-failed">–</div><div class="hint">DOWN checks</div></div>
+  <div class="panel stat-card accent"><div class="label">Last success</div><div class="value small" id="s-last-success">–</div><div class="hint" id="s-last-success-abs">&nbsp;</div></div>
+</section>
+
+<section class="panel mt">
+  <div class="panel-head">
+    <h2>Response time</h2>
+    <span class="sub">Dashed line = slow threshold (<span id="threshold-label">{{ monitor.slow_threshold_ms }}</span> ms). Red ticks = DOWN checks.</span>
+  </div>
+  <div class="panel-body"><div class="chart" id="detail-chart"></div></div>
+</section>
+
+<section class="grid grid-1-1 mt">
+  <div class="panel">
+    <div class="panel-head"><h2>Configuration</h2></div>
+    <div class="panel-body"><dl class="kv" id="config-list"></dl></div>
+  </div>
+  <div class="panel" id="json-panel">
+    <div class="panel-head"><h2>JSON change detection</h2><span class="sub" id="json-sub"></span></div>
+    <div class="panel-body" id="json-body"></div>
+  </div>
+</section>
+
+<section class="grid grid-1-1 mt">
+  <div class="panel">
+    <div class="panel-head"><h2>Incidents</h2><span class="sub">Opened after {{ incident_threshold }} consecutive DOWN checks</span></div>
+    <div class="panel-body flush scroll-y"><ul class="list" id="incident-list"></ul></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><h2>Recent failures</h2></div>
+    <div class="panel-body flush scroll-y"><ul class="list" id="failure-list"></ul></div>
+  </div>
+</section>
+
+<section class="panel mt">
+  <div class="panel-head"><h2>Response history</h2><span class="sub" id="history-sub"></span></div>
+  <div class="panel-body flush">
+    <div class="table-wrap scroll-y" style="max-height:480px">
+      <table>
+        <thead><tr><th>Checked at</th><th>Status</th><th class="num">HTTP</th><th class="num">Response</th><th class="hide-sm">Details</th></tr></thead>
+        <tbody id="history-rows"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>window.APIWATCH_MONITOR_ID = {{ monitor.id }};</script>
+<script src="{{ asset('js/monitor.js') }}"></script>
+{% endblock %}
