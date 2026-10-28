@@ -1,6 +1,6 @@
 [project]
 name = "apiwatch"
-version = "1.0.0"
+version = "1.0.1"
 description = "Open-source API monitoring dashboard built with Python and FastAPI. Track uptime, latency, incidents, and JSON response changes."
 readme = "README.md"
 license = "MIT"

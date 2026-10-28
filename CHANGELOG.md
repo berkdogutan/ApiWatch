@@ -4,9 +4,22 @@ All notable changes to APIWatch are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-10-28
 
-Fixes from a full code review.
+Fixes from a full code review. One change needs action from API clients: approving JSON
+changes now requires the reviewed `pending_fields` (see Changed).
+
+### Changed
+- Approving JSON changes requires the reviewed `pending_fields` and is rejected with
+  `409` if a newer response replaced them. This is incompatible with 1.0.0 API clients;
+  the dashboard sends the fields itself.
+- JSON inspection with `HEAD` is rejected with `422` (HEAD responses have no body).
+  Monitors saved this way by 1.0.0 still load; fix them on the next edit.
+- JSON numbers are a single `number` type, so `19.99` → `20` is no longer a type change.
+  Baselines saved by 1.0.0 are read accordingly.
+- SQLite runs in WAL mode: while APIWatch runs, `apiwatch.db-wal` and `apiwatch.db-shm`
+  sit next to the database. Keep `data/` on a local disk, and stop APIWatch before
+  copying or moving the database.
 
 ### Fixed
 - URLs the HTTP client cannot send (for example a DEL character, `i❤.ws`, `010.0.0.1`)
@@ -24,11 +37,6 @@ Fixes from a full code review.
   re-validates a changed URL).
 - Turning JSON inspection off no longer deletes the baseline, so changes made meanwhile
   are reported instead of silently accepted.
-- Approving JSON changes now requires the reviewed `pending_fields` and is rejected with
-  `409` if a newer response replaced them.
-- JSON inspection with `HEAD` is rejected (HEAD responses have no body).
-- JSON numbers are a single `number` type, so `19.99` → `20` is no longer a type change.
-  Baselines saved by 1.0.0 are read accordingly.
 - Errors while reading a body for JSON inspection are warnings and no longer turn a
   `200` into DOWN.
 - If an address does not answer within its share of the timeout, the next validated
@@ -111,4 +119,5 @@ First public release.
 - No notifications, history retention or schema migrations.
 - See the README section "Security and deployment limitations" for the full list.
 
+[1.0.1]: docs/releases/v1.0.1.md
 [1.0.0]: docs/releases/v1.0.0.md
