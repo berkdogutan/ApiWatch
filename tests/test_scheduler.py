@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import update
 
 from app.config import Settings
 from app.main import create_app
 from app.models import CheckResult, Monitor
 from app.services import scheduler as scheduler_module
 from app.services.checker import build_http_client
-from app.services.monitoring import CheckInProgressError, MonitorRunner
-from app.services.scheduler import MonitorScheduler, job_id
+from app.services.monitoring import CheckInProgressError, MonitorChangedError, MonitorRunner
+from app.services.scheduler import (
+    IN_FLIGHT_GRACE,
+    STAGGER_WINDOW_SECONDS,
+    MonitorScheduler,
+    job_id,
+    stagger_offset,
+)
 from tests.conftest import MockAPI, monitor_payload
 
 
@@ -58,7 +65,8 @@ async def test_scheduler_lifecycle(session_factory, settings: Settings, mock_api
             enabled.enabled = True
             scheduler.sync(enabled)
             gap = scheduler.next_run_time(disabled.id) - scheduler.next_run_time(enabled.id)
-            assert abs(gap.total_seconds() - (disabled.id - enabled.id)) < 0.5
+            expected = stagger_offset(disabled.id, 60) - stagger_offset(enabled.id, 120)
+            assert abs(gap.total_seconds() - expected) < 0.5
 
             scheduler.remove(disabled.id)
             scheduler.remove(disabled.id)  # idempotent
@@ -110,13 +118,18 @@ async def test_shutdown_cancels_in_flight_checks_cleanly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr(scheduler_module, "FIRST_RUN_DELAY", timedelta(0))
-    monkeypatch.setattr(scheduler_module, "STAGGER_SECONDS", 1)  # run immediately
+    monkeypatch.setattr(scheduler_module, "STAGGER_WINDOW_SECONDS", 0)  # run immediately
     add_monitor(session_factory)
     started = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def hanging(request: httpx.Request) -> httpx.Response:
         started.set()
-        await asyncio.sleep(30)
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return httpx.Response(200)
 
     async with build_http_client(httpx.MockTransport(hanging)) as client:
@@ -124,12 +137,87 @@ async def test_shutdown_cancels_in_flight_checks_cleanly(
         scheduler.start()
         await asyncio.wait_for(started.wait(), timeout=5)  # APScheduler ran the job
         scheduler.shutdown()
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(cancelled.wait(), timeout=5)  # the request really was cancelled
         assert not scheduler.running
 
     with session_factory() as db:
         assert db.query(CheckResult).count() == 0  # nothing half-written
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_stagger_spreads_any_number_of_monitors() -> None:
+    offsets = sorted(stagger_offset(monitor_id, 60) for monitor_id in range(1, 41))
+    assert all(0 <= offset < STAGGER_WINDOW_SECONDS for offset in offsets)
+    assert min(b - a for a, b in zip(offsets, offsets[1:], strict=False)) > 0.25
+    # IDs that are equal modulo 10 no longer start together.
+    assert len({round(stagger_offset(monitor_id, 60), 3) for monitor_id in (1, 11, 21)}) == 3
+
+
+async def test_replacing_a_job_mid_check_waits_for_the_check(
+    session_factory, settings: Settings
+) -> None:
+    monitor = add_monitor(session_factory)
+    release = asyncio.Event()
+
+    async def blocking(request: httpx.Request) -> httpx.Response:
+        await release.wait()
+        return httpx.Response(200)
+
+    async with build_http_client(httpx.MockTransport(blocking)) as client:
+        runner = MonitorRunner(session_factory, client, settings)
+        scheduler = MonitorScheduler(runner)
+        scheduler.start()
+        try:
+            in_flight = asyncio.create_task(runner.check_monitor(monitor.id))
+            await asyncio.sleep(0.05)
+            scheduler.sync(monitor)  # e.g. the user saved an edit during the check
+            wait = scheduler.next_run_time(monitor.id) - datetime.now(UTC)
+            # Otherwise APScheduler would skip the run (max_instances=1 per job id).
+            assert wait > IN_FLIGHT_GRACE
+            release.set()
+            await in_flight
+        finally:
+            scheduler.shutdown()
+
+
+@pytest.mark.parametrize("change", ["edit", "same_tick_edit", "replace"])
+async def test_result_is_discarded_when_monitor_changes_mid_check(
+    session_factory, settings: Settings, change: str
+) -> None:
+    monitor = add_monitor(session_factory, url="https://api.example.com/broken")
+    in_request = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking(request: httpx.Request) -> httpx.Response:
+        in_request.set()
+        await release.wait()
+        return httpx.Response(503)
+
+    async with build_http_client(httpx.MockTransport(blocking)) as client:
+        runner = MonitorRunner(session_factory, client, settings)
+        in_flight = asyncio.create_task(runner.check_monitor(monitor.id))
+        await asyncio.wait_for(in_request.wait(), timeout=5)  # the check loaded the monitor
+        with session_factory() as db:
+            if change == "edit":
+                db.get(Monitor, monitor.id).url = "https://api.example.com/fixed"
+            elif change == "same_tick_edit":
+                # A coarse clock (15.6 ms ticks on Windows with Python 3.12) leaves updated_at
+                # unchanged when an edit closely follows the previous write.
+                db.execute(
+                    update(Monitor)
+                    .where(Monitor.id == monitor.id)
+                    .values(url="https://api.example.com/fixed", updated_at=monitor.updated_at)
+                )
+            else:  # deleted and re-created; SQLite reuses the highest id
+                db.delete(db.get(Monitor, monitor.id))
+                db.flush()
+                db.add(Monitor(**monitor_payload(name="Replacement")))
+            db.commit()
+        release.set()
+        with pytest.raises(MonitorChangedError):
+            await in_flight
+    with session_factory() as db:
+        assert db.query(CheckResult).count() == 0
 
 
 def test_app_keeps_jobs_in_sync(tmp_path, transport) -> None:

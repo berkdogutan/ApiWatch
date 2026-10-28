@@ -156,5 +156,11 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
-  window.APIWatchChart = { renderChart, formatMs };
+  /** History results -> chart points. DOWN checks have no latency to plot: they break the
+   *  line and are drawn as red ticks. */
+  function pointsFromResults(results) {
+    return results.map((r) => ({ t: new Date(r.checked_at), v: r.status === "DOWN" ? null : r.response_time_ms, status: r.status }));
+  }
+
+  window.APIWatchChart = { renderChart, formatMs, pointsFromResults };
 })();

@@ -148,6 +148,12 @@
     if (!(d.timeout_seconds > 0 && d.timeout_seconds <= 30)) fail("timeout_seconds", "Timeout must be between 0 and 30 seconds.");
     else if (d.timeout_seconds >= d.interval_seconds) fail("timeout_seconds", "Timeout must be shorter than the interval.");
     if (!Number.isInteger(d.slow_threshold_ms) || d.slow_threshold_ms < 1 || d.slow_threshold_ms > 60000) fail("slow_threshold_ms", "Threshold must be 1–60000 ms.");
+    if (d.inspect_json && d.method !== "GET") {
+      const fe = document.getElementById("form-error");
+      fe.textContent = "Inspect JSON needs the GET method: HEAD responses have no body.";
+      fe.hidden = false;
+      ok = false;
+    }
     return ok;
   }
 
@@ -211,7 +217,10 @@
   }
 
   async function setEnabled(monitor, enabled) {
-    const updated = await api(`/api/monitors/${monitor.id}`, { method: "PUT", body: Object.assign(monitorPayload(monitor), { enabled }) });
+    // PUT replaces the whole configuration: start from the server's current one, not this
+    // page's copy (up to 10 s old), so an edit saved elsewhere meanwhile is not reverted.
+    const current = await api(`/api/monitors/${monitor.id}`);
+    const updated = await api(`/api/monitors/${monitor.id}`, { method: "PUT", body: Object.assign(monitorPayload(current), { enabled }) });
     toast(`${updated.name} ${enabled ? "enabled" : "paused"}`, "info");
     return updated;
   }
@@ -239,8 +248,39 @@
     });
   }
 
+  /**
+   * Run `load` now, every `ms` while the tab is visible, and whenever the returned function
+   * is called. A call made while a load is running is queued, never dropped, so the page
+   * always ends up showing data for the latest window and actions.
+   */
+  function poller(load, ms) {
+    let running = false;
+    let queued = false;
+    async function run() {
+      if (running) { queued = true; return; }
+      running = true;
+      try {
+        await load();
+      } finally {
+        running = false;
+        if (queued) { queued = false; run(); }
+      }
+    }
+    setInterval(() => { if (!document.hidden) run(); }, ms);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) run(); });
+    run();
+    return run;
+  }
+
+  // The header's "Add monitor" button exists on every page; pages may replace this hook.
+  const hooks = { onMonitorCreated: (created) => { window.location.href = `/monitors/${created.id}`; } };
+  document.addEventListener("click", (ev) => {
+    if (ev.target.closest("[data-action=add-monitor]")) openMonitorModal(null, (created) => hooks.onMonitorCreated(created));
+  });
+
   window.APIWatch = {
     api, escapeHtml, timeAgo, formatDate, formatDuration, formatMs, formatPct, statusPill, toast, ICONS,
     openMonitorModal, closeMonitorModal, runCheck, setEnabled, deleteMonitor, setRefreshed, bindWindowPicker,
+    poller, hooks,
   };
 })();

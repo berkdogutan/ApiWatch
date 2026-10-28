@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import ipaddress
 import socket
 
 import pytest
 
 from app.config import Settings
-from app.services.url_validation import DNSResolutionError, UnsafeURLError, validate_url
+from app.services.url_validation import (
+    DNSResolutionError,
+    UnsafeURLError,
+    _classify,
+    validate_url,
+)
 from tests.conftest import REAL_RESOLVE_HOST
 
 
@@ -74,10 +80,45 @@ def test_localhost_requires_development_flag(url: str) -> None:
     assert validate_url(url, make_settings(allow_localhost=True)).addresses
 
 
-def test_localhost_name_is_not_resolved() -> None:
-    # "localhost" maps straight to 127.0.0.1 instead of trusting the hosts file / DNS.
+def test_localhost_keeps_every_loopback_address() -> None:
+    # A dev server listening only on ::1 must stay reachable (IPv4 is still tried first).
     target = validate_url("http://localhost:8001/", make_settings(allow_localhost=True))
-    assert target.addresses == ("127.0.0.1",)
+    assert target.addresses == ("127.0.0.1", "::1")
+
+
+def test_metadata_hostname_is_blocked_by_name() -> None:
+    # The fake DNS answer is public, so only the hostname rule can reject it.
+    with pytest.raises(UnsafeURLError, match="is blocked"):
+        validate_url("http://metadata.google.internal/", make_settings())
+
+
+def test_ipv4_embedding_ranges_are_blocked_on_any_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CPython < 3.12.4 still treats 6to4 as global; the explicit list must not depend on it.
+    monkeypatch.setattr(ipaddress.IPv6Address, "is_global", property(lambda self: True))
+    for address in ("2002:a00:1::1", "2001::1", "64:ff9b::a00:1", "64:ff9b:1::a00:1", "::a00:1"):
+        assert _classify(address) == "blocked", address
+
+
+def test_idn_hosts_are_resolved_by_their_idna_2008_name() -> None:
+    # IDNA 2003 (Python's built-in codec) would look up strasse.de, a different domain.
+    target = validate_url("https://straße.de/", make_settings())
+    assert target.host == "xn--strae-oqa.de"
+    assert target.addresses == ("81.169.145.78",)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.example.com/x\x7f",  # DEL
+        "https://i❤.ws/",  # valid only under IDNA 2003
+        "http://a‍b.com/",  # zero-width joiner
+        "http://010.0.0.1/",  # leading-zero IPv4 (read as octal by some resolvers)
+        "http://api.example.com:99999/",
+    ],
+)
+def test_rejects_urls_the_http_client_cannot_request(url: str) -> None:
+    with pytest.raises(UnsafeURLError):
+        validate_url(url, make_settings())
 
 
 def test_rejects_credentials_in_url() -> None:

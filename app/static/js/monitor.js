@@ -4,10 +4,11 @@
   const A = window.APIWatch;
   const id = window.APIWATCH_MONITOR_ID;
   const WINDOW_LABEL = { "24h": "last 24 hours", "7d": "last 7 days", all: "all stored data" };
+  // Checks whose body could not be compared with the JSON baseline.
+  const NOT_INSPECTED = new Set(["invalid_json", "json_not_object", "response_too_large"]);
   let currentWindow = "24h";
   let monitor = null;
   let chartSeries = [];
-  let refreshing = false;
 
   function renderHeader() {
     document.getElementById("monitor-name").textContent = monitor.name;
@@ -39,9 +40,9 @@
     document.getElementById("config-list").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   }
 
-  function renderStats(stats) {
+  function renderStats(stats, w) {
     document.getElementById("s-uptime").textContent = A.formatPct(stats.uptime_percentage);
-    document.getElementById("s-uptime-hint").textContent = stats.total_checks ? `${stats.total_checks} checks · ${WINDOW_LABEL[currentWindow]}` : "No checks in this window";
+    document.getElementById("s-uptime-hint").textContent = stats.total_checks ? `${stats.total_checks} checks · ${WINDOW_LABEL[w]}` : "No checks in this window";
     document.getElementById("s-avg").textContent = A.formatMs(stats.avg_response_time_ms);
     document.getElementById("s-minmax").textContent = stats.min_response_time_ms != null ? `min ${A.formatMs(stats.min_response_time_ms)} · max ${A.formatMs(stats.max_response_time_ms)}` : "No responses yet";
     document.getElementById("s-success").textContent = stats.successful_checks;
@@ -49,8 +50,8 @@
     document.getElementById("s-last-success").textContent = stats.last_successful_check ? A.timeAgo(stats.last_successful_check) : "N/A";
     document.getElementById("s-last-success-abs").textContent = stats.last_successful_check ? A.formatDate(stats.last_successful_check) : "No successful check in window";
     document.getElementById("window-note").textContent = stats.first_check
-      ? `Showing ${WINDOW_LABEL[currentWindow]} · data since ${A.formatDate(stats.first_check)}`
-      : `Showing ${WINDOW_LABEL[currentWindow]}`;
+      ? `Showing ${WINDOW_LABEL[w]} · data since ${A.formatDate(stats.first_check)}`
+      : `Showing ${WINDOW_LABEL[w]}`;
   }
 
   function drawChart() {
@@ -100,7 +101,7 @@
       <span class="time" title="${A.formatDate(f.checked_at)}">${A.timeAgo(f.checked_at)}</span></li>`).join("");
   }
 
-  function renderJson(baseline) {
+  function renderJson(baseline, latest) {
     const body = document.getElementById("json-body");
     const sub = document.getElementById("json-sub");
     if (!monitor.inspect_json) {
@@ -121,76 +122,71 @@
       pending = `<div class="callout"><strong>${baseline.pending_changes.length} change(s) detected</strong> <span class="faint">at ${A.formatDate(baseline.pending_detected_at)}</span>
         <div style="margin-top:8px">${baseline.pending_changes.map((c) => `<div class="change-row"><span class="badge ${LABEL[c.change][0]}">${LABEL[c.change][1]}</span><code>${A.escapeHtml(c.field)}</code><span class="faint">${c.old_type ? A.escapeHtml(c.old_type) : "–"} → ${c.new_type ? A.escapeHtml(c.new_type) : "–"}</span></div>`).join("")}</div>
         <div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap"><button class="btn btn-primary btn-sm" type="button" id="btn-approve">Approve as new baseline</button><span class="faint">The saved baseline only changes after approval.</span></div></div>`;
+    } else if (latest && (latest.status === "DOWN" || NOT_INSPECTED.has(latest.error_category))) {
+      sub.textContent = "Latest response not compared";
+      const reason = latest.status === "DOWN" ? "the check failed" : (latest.error_message || latest.error_category);
+      pending = `<div class="callout">The latest response could not be compared with the baseline: ${A.escapeHtml(reason)}.</div>`;
     } else {
       sub.textContent = "No changes";
-      pending = '<div class="callout ok">Latest response matches the approved baseline.</div>';
+      pending = '<div class="callout ok">The latest inspected response matches the approved baseline.</div>';
     }
     body.innerHTML = `${pending}<div class="faint" style="margin-bottom:8px">Approved baseline · ${A.formatDate(baseline.approved_at)}</div><div class="fields">${chips || '<span class="faint">(empty object)</span>'}</div>`;
     const approve = document.getElementById("btn-approve");
     if (approve) approve.addEventListener("click", async () => {
       approve.disabled = true;
       try {
-        await A.api(`/api/monitors/${id}/json-baseline/approve`, { method: "POST" });
+        // Send what was reviewed: if a newer response replaced it, the server answers 409.
+        await A.api(`/api/monitors/${id}/json-baseline/approve`, { method: "POST", body: { pending_fields: baseline.pending_fields } });
         A.toast("Baseline updated", "success");
-        refresh();
-      } catch (e) { A.toast(e.message, "error"); approve.disabled = false; }
+      } catch (e) {
+        A.toast(e.status === 409 ? `${e.message}.` : e.message, "error");
+      }
+      refresh();
     });
   }
 
-  async function refresh() {
-    if (refreshing) return;
-    refreshing = true;
+  async function load() {
+    const w = currentWindow; // label everything with the window this data was fetched for
     try {
-      const [m, history, chart, incidents, failures] = await Promise.all([
+      const [m, history, chart, incidents, failures, baseline] = await Promise.all([
         A.api(`/api/monitors/${id}`),
-        A.api(`/api/monitors/${id}/history?window=${currentWindow}&limit=200`),
-        A.api(`/api/monitors/${id}/history?window=${currentWindow}&points=400`),
+        A.api(`/api/monitors/${id}/history?window=${w}&limit=200`),
+        A.api(`/api/monitors/${id}/history?window=${w}&points=400`),
         A.api(`/api/incidents?monitor_id=${id}&limit=50`),
         A.api(`/api/failures?monitor_id=${id}&limit=15`),
+        A.api(`/api/monitors/${id}/json-baseline`).catch((e) => { if (e.status === 404) return null; throw e; }),
       ]);
       monitor = m;
-      let baseline = null;
-      if (monitor.inspect_json) {
-        try { baseline = await A.api(`/api/monitors/${id}/json-baseline`); } catch (e) { if (e.status !== 404) throw e; }
-      }
       renderHeader();
       renderConfig();
-      renderStats(history.stats);
-      chartSeries = [{
-        name: monitor.name,
-        color: "#3b82f6",
-        points: chart.results.map((r) => ({ t: new Date(r.checked_at), v: r.status === "DOWN" ? null : r.response_time_ms, status: r.status })),
-      }];
+      renderStats(history.stats, w);
+      chartSeries = [{ name: monitor.name, color: "#3b82f6", points: window.APIWatchChart.pointsFromResults(chart.results) }];
       drawChart();
       renderHistory(history);
       renderIncidents(incidents);
       renderFailures(failures);
-      renderJson(baseline);
+      renderJson(baseline, history.results[0]);
       A.setRefreshed();
     } catch (err) {
       if (err.status === 404) { window.location.href = "/"; return; }
       A.toast("Could not load monitor: " + err.message, "error");
-    } finally {
-      refreshing = false;
     }
   }
 
   document.getElementById("btn-check").addEventListener("click", async (ev) => { await A.runCheck(id, ev.currentTarget); refresh(); });
-  document.getElementById("btn-edit").addEventListener("click", () => A.openMonitorModal(monitor, refresh));
+  document.getElementById("btn-edit").addEventListener("click", () => { if (monitor) A.openMonitorModal(monitor, refresh); });
   document.getElementById("btn-toggle").addEventListener("click", async () => {
+    if (!monitor) return;
     try { await A.setEnabled(monitor, !monitor.enabled); refresh(); } catch (e) { A.toast(e.message, "error"); }
   });
   document.getElementById("btn-delete").addEventListener("click", async () => {
+    if (!monitor) return;
     try { if (await A.deleteMonitor(monitor)) window.location.href = "/"; } catch (e) { A.toast(e.message, "error"); }
-  });
-  document.addEventListener("click", (ev) => {
-    if (ev.target.closest("[data-action=add-monitor]")) A.openMonitorModal(null, (created) => { window.location.href = `/monitors/${created.id}`; });
   });
   A.bindWindowPicker((w) => { currentWindow = w; refresh(); });
 
   let resizeTimer;
   window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(drawChart, 150); });
 
-  refresh();
-  setInterval(refresh, 10000);
+  const refresh = A.poller(load, 10000);
 })();

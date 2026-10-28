@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -8,14 +7,22 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.database import get_db
 from app.models import CheckResult, Incident, JsonBaseline, Monitor
-from app.schemas.check import CheckResultRead, HistoryRead, JsonBaselineRead, StatsRead
+from app.routers.params import MonitorId
+from app.schemas.check import (
+    BaselineApproval,
+    CheckResultRead,
+    HistoryRead,
+    JsonBaselineRead,
+    StatsRead,
+)
 from app.schemas.monitor import MonitorCreate, MonitorRead, MonitorSummary, MonitorUpdate
 from app.services import analytics
 from app.services.json_changes import approve_pending
-from app.services.monitoring import CheckInProgressError, MonitorRunner
-from app.services.url_validation import UnsafeURLError, validate_url
+from app.services.monitoring import CheckInProgressError, MonitorChangedError, MonitorRunner
+from app.services.url_validation import RESOLVER_POOL, UnsafeURLError, validate_url
 
 router = APIRouter(prefix="/api/monitors", tags=["monitors"])
 
@@ -30,10 +37,12 @@ def url_error(message: str) -> HTTPException:
     )
 
 
-async def ensure_safe_url(request: Request, url: str) -> None:
+def ensure_safe_url(settings: Settings, url: str) -> None:
+    """Validate a URL that is about to be saved. The DNS lookup runs in its own thread, so
+    a hung resolver is abandoned after the timeout instead of hanging the request."""
+    future = RESOLVER_POOL.submit(validate_url, url, settings)
     try:
-        async with asyncio.timeout(URL_VALIDATION_TIMEOUT_SECONDS):
-            await asyncio.to_thread(validate_url, url, request.app.state.settings)
+        future.result(timeout=URL_VALIDATION_TIMEOUT_SECONDS)
     except UnsafeURLError as exc:
         raise url_error(str(exc)) from None
     except TimeoutError:
@@ -68,7 +77,9 @@ def build_summary(db: Session, request: Request, monitor: Monitor) -> MonitorSum
         last_status_code=latest.status_code if latest else None,
         uptime_24h=analytics.compute_stats(db, "24h", monitor.id)["uptime_percentage"],
         has_open_incident=bool(has_open),
-        pending_json_changes=bool(baseline and baseline.pending_fields is not None),
+        pending_json_changes=bool(
+            monitor.inspect_json and baseline and baseline.pending_fields is not None
+        ),
         next_check_at=scheduler.next_run_time(monitor.id) if scheduler else None,
     )
 
@@ -100,10 +111,10 @@ def list_monitors(request: Request, db: Session = Depends(get_db)) -> list[Monit
 
 
 @router.post("", response_model=MonitorRead, status_code=status.HTTP_201_CREATED)
-async def create_monitor(
+def create_monitor(
     payload: MonitorCreate, request: Request, db: Session = Depends(get_db)
 ) -> MonitorRead:
-    await ensure_safe_url(request, payload.url)
+    ensure_safe_url(request.app.state.settings, payload.url)
     monitor = Monitor(**payload.model_dump())
     db.add(monitor)
     commit_unique_name(db, payload.name)
@@ -113,24 +124,25 @@ async def create_monitor(
 
 
 @router.get("/{monitor_id}", response_model=MonitorRead)
-def get_monitor(monitor_id: int, request: Request, db: Session = Depends(get_db)) -> MonitorRead:
+def get_monitor(
+    monitor_id: MonitorId, request: Request, db: Session = Depends(get_db)
+) -> MonitorRead:
     return to_read(db, request, get_monitor_or_404(db, monitor_id))
 
 
 @router.put("/{monitor_id}", response_model=MonitorRead)
-async def update_monitor(
-    monitor_id: int, payload: MonitorUpdate, request: Request, db: Session = Depends(get_db)
+def update_monitor(
+    monitor_id: MonitorId, payload: MonitorUpdate, request: Request, db: Session = Depends(get_db)
 ) -> MonitorRead:
     monitor = get_monitor_or_404(db, monitor_id)
-    await ensure_safe_url(request, payload.url)
+    if payload.url != monitor.url:
+        # An unchanged URL is re-validated before every check anyway. Validating it here
+        # too would make a monitor whose host stopped resolving impossible to pause or edit.
+        ensure_safe_url(request.app.state.settings, payload.url)
     for field, value in payload.model_dump().items():
         setattr(monitor, field, value)
-    if not payload.inspect_json:
-        # Turning inspection off discards the baseline; re-enabling captures a fresh one.
-        # (A URL change keeps it, so moving to e.g. /v2 surfaces the differences.)
-        baseline = db.scalar(select(JsonBaseline).where(JsonBaseline.monitor_id == monitor.id))
-        if baseline is not None:
-            db.delete(baseline)
+    # The JSON baseline is kept even when inspection is turned off: re-enabling it later
+    # reports whatever changed meanwhile instead of silently accepting it.
     commit_unique_name(db, payload.name)
     db.refresh(monitor)
     sync_schedule(request, monitor)
@@ -138,7 +150,9 @@ async def update_monitor(
 
 
 @router.delete("/{monitor_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_monitor(monitor_id: int, request: Request, db: Session = Depends(get_db)) -> Response:
+def delete_monitor(
+    monitor_id: MonitorId, request: Request, db: Session = Depends(get_db)
+) -> Response:
     monitor = get_monitor_or_404(db, monitor_id)
     db.delete(monitor)
     db.commit()
@@ -149,16 +163,16 @@ def delete_monitor(monitor_id: int, request: Request, db: Session = Depends(get_
 
 
 @router.post("/{monitor_id}/check", response_model=CheckResultRead)
-async def run_manual_check(
-    monitor_id: int, request: Request, db: Session = Depends(get_db)
-) -> CheckResult:
-    get_monitor_or_404(db, monitor_id)
-    db.close()  # release the connection while the HTTP check runs
+async def run_manual_check(monitor_id: MonitorId, request: Request) -> CheckResult:
     runner: MonitorRunner = request.app.state.runner
     try:
         result = await runner.check_monitor(monitor_id)
     except CheckInProgressError as exc:
         raise HTTPException(409, detail=str(exc)) from None
+    except MonitorChangedError:
+        raise HTTPException(
+            409, detail="The monitor was changed while the check was running; run it again"
+        ) from None
     if result is None:
         raise HTTPException(404, detail=f"Monitor {monitor_id} not found")
     return result
@@ -166,7 +180,7 @@ async def run_manual_check(
 
 @router.get("/{monitor_id}/history", response_model=HistoryRead)
 def get_history(
-    monitor_id: int,
+    monitor_id: MonitorId,
     window: Literal["24h", "7d", "all"] = "24h",
     limit: int = Query(default=500, ge=1, le=5000),
     points: int | None = Query(
@@ -174,8 +188,8 @@ def get_history(
         ge=10,
         le=2000,
         description="Instead of the newest `limit` results, return about this many results "
-        "spread evenly over the whole window, plus a similar sample of DOWN checks. "
-        "Useful for charts.",
+        "spread evenly over the whole window, plus the first and last DOWN check of each "
+        "outage. Useful for charts.",
     ),
     db: Session = Depends(get_db),
 ) -> HistoryRead:
@@ -193,7 +207,7 @@ def get_history(
 
 
 @router.get("/{monitor_id}/json-baseline", response_model=JsonBaselineRead)
-def get_json_baseline(monitor_id: int, db: Session = Depends(get_db)) -> JsonBaseline:
+def get_json_baseline(monitor_id: MonitorId, db: Session = Depends(get_db)) -> JsonBaseline:
     monitor = get_monitor_or_404(db, monitor_id)
     if monitor.json_baseline is None:
         raise HTTPException(404, detail="No JSON baseline captured yet")
@@ -201,11 +215,20 @@ def get_json_baseline(monitor_id: int, db: Session = Depends(get_db)) -> JsonBas
 
 
 @router.post("/{monitor_id}/json-baseline/approve", response_model=JsonBaselineRead)
-def approve_json_baseline(monitor_id: int, db: Session = Depends(get_db)) -> JsonBaseline:
+def approve_json_baseline(
+    monitor_id: MonitorId, payload: BaselineApproval, db: Session = Depends(get_db)
+) -> JsonBaseline:
     monitor = get_monitor_or_404(db, monitor_id)
     baseline = monitor.json_baseline
-    if baseline is None or not approve_pending(baseline):
+    if baseline is None or baseline.pending_fields is None:
         raise HTTPException(409, detail="There are no pending JSON changes to approve")
+    if baseline.pending_fields != payload.pending_fields:
+        raise HTTPException(
+            409,
+            detail="The pending JSON changes were replaced by a newer response; "
+            "review them again before approving",
+        )
+    approve_pending(baseline)
     db.commit()
     db.refresh(baseline)
     return baseline

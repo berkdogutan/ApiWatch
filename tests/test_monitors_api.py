@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.services import url_validation
 from tests.conftest import monitor_payload
 
 
@@ -149,3 +151,29 @@ def test_health_endpoint(client: TestClient) -> None:
     body = client.get("/health").json()
     assert body["status"] == "ok"
     assert body["database"] == "ok"
+
+
+def test_monitor_with_failing_dns_can_still_be_paused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor_id = client.post("/api/monitors", json=monitor_payload()).json()["id"]
+
+    def nxdomain(host: str, port: int) -> list[str]:
+        raise OSError("getaddrinfo failed")
+
+    monkeypatch.setattr(url_validation, "resolve_host", nxdomain)  # the host stopped resolving
+    paused = client.put(f"/api/monitors/{monitor_id}", json=monitor_payload(enabled=False))
+    assert paused.status_code == 200
+    assert paused.json()["enabled"] is False
+    # A *new* URL is still validated.
+    moved = client.put(
+        f"/api/monitors/{monitor_id}", json=monitor_payload(url="https://moved.example.com/")
+    )
+    assert moved.status_code == 422
+
+
+def test_out_of_range_ids_are_rejected(client: TestClient) -> None:
+    too_big = 2**63
+    assert client.get(f"/api/monitors/{too_big}").status_code == 422
+    assert client.get(f"/api/failures?monitor_id={too_big}").status_code == 422
+    assert client.get("/api/monitors/0").status_code == 422

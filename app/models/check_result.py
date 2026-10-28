@@ -35,3 +35,12 @@ class CheckResult(Base):
     error_message: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
     monitor: Mapped[Monitor] = relationship(back_populates="results")
+
+
+# Serves "most recent failed checks" across all monitors without scanning every result.
+Index(
+    "ix_check_results_failed",
+    CheckResult.checked_at,
+    CheckResult.id,
+    sqlite_where=CheckResult.success.is_(False),
+)

@@ -57,14 +57,18 @@ banner appears because the demo enables localhost targets.*
 - **DOWN**: timeout, DNS or connection failure, blocked target or unexpected status code.
 - Each result stores a typed error category (`timeout`, `dns_error`, `connection_error`,
   `unexpected_status`, `invalid_url`, `invalid_json`, …) and a short sanitized message.
-  No response bodies or credentials are stored.
+  No response bodies, cookies or credentials are stored.
 - The timeout is a deadline for the whole check: DNS lookup, connection and response.
+  When a host has several addresses, the connect timeout is shared between them, so an
+  unreachable address still leaves time to try the next one.
 
 **Scheduling**
 - APScheduler 3 `AsyncIOScheduler` with one job per enabled monitor.
 - Jobs are updated as soon as a monitor changes and rebuilt from SQLite on startup.
-- A monitor never has two checks running at once. Shutdown cancels in-flight checks
-  without writing partial results.
+- A monitor never has two checks running at once. A result is discarded, not stored, if
+  the monitor was edited or deleted while its check was running. Shutdown cancels
+  in-flight checks without writing partial results.
+- Monitors start a few seconds apart, so their checks don't run at the same instant.
 
 **Analytics** (computed in SQL from stored checks)
 - Total, successful and failed checks.
@@ -78,8 +82,13 @@ banner appears because the demo enables localhost targets.*
 
 **JSON change detection** (optional, per monitor)
 - Records the top-level keys and value types of a JSON object response as a baseline.
+  Types are JSON types (`string`, `number`, `boolean`, `array`, `object`, `null`), so a
+  value change such as `19.99` → `20` is not a type change.
 - Reports added, removed and type-changed fields. The baseline changes only when you
-  approve it.
+  approve the changes you reviewed; if a newer response replaced them meanwhile, the
+  approval is rejected.
+- Turning inspection off keeps the baseline, so anything that changed meanwhile is
+  reported when you turn it back on.
 
 **Dashboard**
 - Summary cards, a monitor table with actions and a multi-series response-time chart.
@@ -118,10 +127,11 @@ flowchart LR
    once.
 2. The URL is validated again and the host is resolved. Every resolved address must be
    allowed.
-3. The request connects to one of those validated addresses. The `Host` header, TLS SNI
-   and certificate verification still use the original hostname. Redirects are not
-   followed.
+3. The request connects to one of those validated addresses, trying the next one if a
+   connection fails or times out. The `Host` header, TLS SNI and certificate verification
+   still use the original hostname. Redirects are not followed.
 4. The result is stored, then incident and JSON-change rules run in the same transaction.
+   Database work runs in worker threads, so it never delays other checks' timing.
 
 > **One worker only.** The scheduler runs inside the web process. Run a single Uvicorn
 > worker, which is what `uv run apiwatch` does. With several workers or replicas, every
@@ -226,7 +236,7 @@ git-ignored. While the switch is on, the dashboard shows a *Development mode* ba
 | `/demo/slow` | `200` after 1.5 s (`MOCK_SLOW_DELAY_SECONDS`) | DEGRADED (threshold 800 ms) |
 | `/demo/error` | `500` | DOWN; incident after 2 checks |
 | `/demo/json` | fixed JSON object | UP; JSON baseline captured |
-| `/demo/json-changed` | `email` removed, `id` integer → string, `created_at` added | UP; 3 JSON changes |
+| `/demo/json-changed` | `email` removed, `id` number → string, `created_at` added | UP; 3 JSON changes |
 
 Things to try:
 1. **Simulate an outage.** Edit "Demo Healthy API" and set its URL to
@@ -248,12 +258,12 @@ external.
 | `GET` | `/api/monitors` | Monitors with current status, last response time and 24 h uptime |
 | `POST` | `/api/monitors` | Create a monitor (`201`); only `name` and `url` are required |
 | `GET` | `/api/monitors/{id}` | One monitor |
-| `PUT` | `/api/monitors/{id}` | Replace a monitor's configuration (all fields required) |
+| `PUT` | `/api/monitors/{id}` | Replace a monitor's configuration (all fields required; the URL is re-validated only when it changes) |
 | `DELETE` | `/api/monitors/{id}` | Delete a monitor and its history (`204`) |
-| `POST` | `/api/monitors/{id}/check` | Run a check now (`409` if one is already running) |
+| `POST` | `/api/monitors/{id}/check` | Run a check now (`409` if one is already running, or if the monitor changed during the check) |
 | `GET` | `/api/monitors/{id}/history` | Results and statistics. `window=24h\|7d\|all`, `limit`, `points` (sampling for charts) |
 | `GET` | `/api/monitors/{id}/json-baseline` | Approved JSON baseline and pending changes |
-| `POST` | `/api/monitors/{id}/json-baseline/approve` | Accept pending JSON changes as the new baseline |
+| `POST` | `/api/monitors/{id}/json-baseline/approve` | Accept the pending changes you reviewed: send their `pending_fields` (`409` if a newer response replaced them) |
 | `GET` | `/api/stats` | Status counts and overall uptime; `window=24h\|7d\|all` |
 | `GET` | `/api/incidents` | Incidents; `status=open\|resolved\|all`, `monitor_id`, `limit` |
 | `GET` | `/api/failures` | Most recent failed checks with error details |
@@ -295,6 +305,12 @@ curl -X PUT http://127.0.0.1:8000/api/monitors/1 -H "Content-Type: application/j
        "expected_status": 200, "interval_seconds": 120, "timeout_seconds": 10,
        "slow_threshold_ms": 800, "enabled": false, "inspect_json": true}'
 
+# Approve JSON changes: send back the pending_fields you reviewed
+# (from GET /api/monitors/1/json-baseline)
+curl -X POST http://127.0.0.1:8000/api/monitors/1/json-baseline/approve \
+  -H "Content-Type: application/json" \
+  -d '{"pending_fields": {"id": "string", "name": "string", "created_at": "string"}}'
+
 # Open incidents
 curl "http://127.0.0.1:8000/api/incidents?status=open"
 ```
@@ -329,25 +345,31 @@ Settings are read from environment variables or a `.env` file. See
 ## Running tests
 
 ```bash
-uv run pytest                 # 95 tests
+uv run pytest                 # 128 tests
 uv run ruff check .           # lint
 uv run ruff format --check .  # formatting
 ```
 
-The tests use `httpx.MockTransport` for HTTP and a fake resolver for DNS. An autouse
-fixture makes any real DNS lookup or outbound connection fail, so the suite cannot
-depend on internet access. It covers:
-- monitor CRUD and validation, including strict `PUT`;
-- URL and SSRF rules, including IPv6 transition ranges, and connecting to the validated
-  address;
+The tests use `httpx.MockTransport` for HTTP and a fake resolver for DNS. Autouse
+fixtures make any real DNS lookup or outbound connection fail (including asyncio
+connections to IP literals) and remove `APIWATCH_*` variables from the environment, so
+the suite cannot depend on internet access or on your shell. It covers:
+- monitor CRUD and validation, including strict `PUT` and pausing a monitor whose host
+  stopped resolving;
+- URL and SSRF rules, including IPv6 transition ranges, IDN hosts, URLs the HTTP client
+  cannot send, and connecting to the validated address;
 - check outcomes: success, slow responses, unexpected status codes, timeouts, DNS and
-  connection failures, redirects, invalid JSON and size limits;
+  connection failures, address fallback, redirects, invalid or deeply nested JSON,
+  compressed bodies, size limits, cookies and protocol errors;
 - uptime and latency statistics, empty history, time windows and chart sampling;
 - incident opening, de-duplication and recovery;
-- JSON baseline comparison and approval;
+- JSON baseline comparison, approval and its compare-and-set check;
 - Host-header and cross-origin protection;
-- enable/disable behaviour, overlap prevention and the scheduler lifecycle (including
-  shutdown during a check and rebuilding jobs after a restart).
+- enable/disable behaviour, overlap prevention, results of monitors changed mid-check
+  and the scheduler lifecycle (including shutdown during a check, staggering, and
+  rebuilding jobs after a restart);
+- database set-up: `python -m app.database`, WAL mode, in-memory databases and adding
+  new indexes to existing databases.
 
 GitHub Actions runs Ruff and pytest on Python 3.12 and 3.13 for every push to `main` and
 every pull request (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -360,11 +382,16 @@ who can reach its port can create monitors and make it send requests. Keep the d
 It is not designed or tested for production deployment.
 
 **Outbound requests (SSRF protection).**
-- Only `http` and `https` URLs are accepted. URLs containing credentials are rejected.
-  Redirects are never followed, and proxy settings and `.netrc` files are ignored.
+- Only `http` and `https` URLs are accepted. URLs are parsed by the same parser that
+  sends the request, so validation and request agree on the host (including the IDNA
+  2008 form of international names). URLs containing credentials are rejected.
+  Redirects are never followed, cookies are never stored, and proxy settings and
+  `.netrc` files are ignored.
 - Every address a hostname resolves to must be public. Loopback, private (RFC 1918),
   link-local (including `169.254.169.254`), CGNAT, multicast, reserved and IPv6
-  transition ranges are rejected, as are well-known cloud-metadata hostnames.
+  transition ranges are rejected, as are well-known cloud-metadata hostnames. The IPv6
+  transition ranges are listed explicitly, so the rule does not depend on the Python
+  patch release.
 - The rules apply when a monitor is saved and again before every check. The request then
   connects to an address that was just validated instead of resolving the name a second
   time. This closes the DNS-rebinding window between the check and the connection.
@@ -393,7 +420,7 @@ It is not designed or tested for production deployment.
 - The Host and Origin checks defend against browser-based attacks only. They are not
   access control. Anyone who can connect to the port can use the API.
 
-**Other limitations of 1.0.0:**
+**Other limitations:**
 - **One process.** Several workers or replicas would duplicate scheduled checks.
 - **Requests.** Only `GET` and `HEAD`, with no custom headers, request bodies or
   authenticated endpoints. Do not put secrets in monitored URLs: URLs are stored and
@@ -408,13 +435,14 @@ It is not designed or tested for production deployment.
   are measured inside the APIWatch process, so a heavily loaded machine inflates them.
   Monitors start a few seconds apart so their checks don't all run at the same instant.
 - **Operations.** No notifications, no history retention and no schema migrations:
-  tables are created with `create_all`.
+  missing tables and indexes are created on start-up, but existing columns are never
+  changed. SQLite runs in WAL mode, so keep `data/` on a local disk, not a network share.
 
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 ## Roadmap
 
-Ideas for future releases. None of these are implemented in 1.0.0.
+Ideas for future releases. None of these are implemented yet.
 
 - Schema migrations with Alembic
 - Notification channels (webhook, email) with cooldowns

@@ -146,3 +146,22 @@ def test_history_window_filter_and_limit(client: TestClient) -> None:
     times = [r["checked_at"] for r in limited["results"]]
     assert times == sorted(times, reverse=True)
     assert client.get(f"/api/monitors/{monitor_id}/history?window=1y").status_code == 422
+
+
+def test_sampling_keeps_every_isolated_outage(session_factory) -> None:
+    # 3,000 checks: one long outage (more DOWN rows than points) plus ten single failures.
+    statuses = ["UP"] * 3000
+    for i in range(1000, 1500):
+        statuses[i] = "DOWN"
+    isolated = [100, 300, 500, 700, 900, 1700, 1900, 2100, 2300, 2900]
+    for i in isolated:
+        statuses[i] = "DOWN"
+    rows = [result(s, age_hours=(3000 - i) / 600) for i, s in enumerate(statuses)]
+    store(session_factory, rows)
+    with session_factory() as db:
+        sampled = sampled_results(db, "all", 1, points=240)
+    sampled_ids = {r.id for r in sampled}
+    assert len(sampled) <= 2 * 240 + 2
+    assert all(rows[i].id in sampled_ids for i in isolated)
+    # The long outage is drawn from its start to its end.
+    assert {rows[1000].id, rows[1499].id} <= sampled_ids

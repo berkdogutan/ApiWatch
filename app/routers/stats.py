@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import CheckResult, Incident, Monitor
+from app.routers.params import MonitorFilter
 from app.schemas.check import CheckResultRead, DashboardStats, StatsRead
 from app.schemas.incident import IncidentRead
 from app.services import analytics
@@ -54,7 +55,7 @@ def get_stats(
 @router.get("/api/incidents", response_model=list[IncidentRead])
 def list_incidents(
     status: Literal["open", "resolved", "all"] = "all",
-    monitor_id: int | None = None,
+    monitor_id: MonitorFilter = None,
     limit: int = Query(default=50, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> list[IncidentRead]:
@@ -91,7 +92,7 @@ def list_incidents(
 
 @router.get("/api/failures", response_model=list[CheckResultRead])
 def recent_failures(
-    monitor_id: int | None = None,
+    monitor_id: MonitorFilter = None,
     limit: int = Query(default=20, ge=1, le=200),
     db: Session = Depends(get_db),
 ) -> list[CheckResult]:

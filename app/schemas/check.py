@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import UTCDateTime
 
@@ -56,6 +56,13 @@ class JsonBaselineRead(BaseModel):
     pending_fields: dict[str, str] | None
     pending_changes: list[JsonChange] | None
     pending_detected_at: UTCDateTime | None
+
+
+class BaselineApproval(BaseModel):
+    pending_fields: dict[str, str] = Field(
+        description="The pending fields you reviewed, as returned by GET .../json-baseline. "
+        "If a newer response has replaced them since, the approval is rejected with 409."
+    )
 
 
 class DashboardStats(BaseModel):

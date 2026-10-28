@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import time
 
 import httpx
@@ -10,24 +12,13 @@ from app.config import Settings
 from app.models import HealthStatus, Monitor
 from app.services import url_validation
 from app.services.checker import build_http_client, run_check
-from tests.conftest import MockAPI
+from tests.conftest import ChunkedStream, MockAPI, monitor_payload
 
 
 def make_monitor(**overrides) -> Monitor:
-    values = dict(
-        id=1,
-        name="Example",
-        url="https://api.example.com/health",
-        method="GET",
-        expected_status=200,
-        interval_seconds=60,
-        timeout_seconds=2.0,
-        slow_threshold_ms=1000,
-        enabled=True,
-        inspect_json=False,
-    )
+    values = monitor_payload(name="Example", timeout_seconds=2.0)
     values.update(overrides)
-    return Monitor(**values)
+    return Monitor(id=1, **values)
 
 
 async def check(mock_api: MockAPI, settings: Settings, **monitor_overrides):
@@ -120,7 +111,7 @@ async def test_json_inspection_extracts_top_level_types(
     )
     outcome = await check(mock_api, settings, inspect_json=True)
     assert outcome.json_fields == {
-        "id": "integer",
+        "id": "number",  # JSON has a single number type
         "name": "string",
         "ok": "boolean",
         "n": "number",
@@ -221,3 +212,99 @@ async def test_slow_dns_counts_towards_the_timeout(
     assert outcome.error_category == "dns_error"
     assert "timed out" in outcome.error_message
     assert mock_api.requests == []
+
+
+async def test_cookies_are_never_stored_or_sent(mock_api: MockAPI, settings: Settings) -> None:
+    # Requests go to pinned IPs; a stored cookie could reach another hostname on that IP.
+    mock_api.respond(200, headers={"Set-Cookie": "session=SECRET; Path=/"})
+    async with build_http_client(httpx.MockTransport(mock_api)) as client:
+        await run_check(make_monitor(), client, settings)
+        await run_check(make_monitor(url="https://status.example.org/"), client, settings)
+        assert len(client.cookies.jar) == 0
+    assert "cookie" not in mock_api.requests[1].headers
+    assert mock_api.requests[0].headers["accept-encoding"] == "identity"
+
+
+async def test_falls_back_after_connect_timeout(mock_api: MockAPI, settings: Settings) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "93.184.216.37":
+            raise httpx.ConnectTimeout("timed out")  # e.g. a firewall dropping SYNs
+        return httpx.Response(200)
+
+    mock_api.handler = handler
+    outcome = await check(mock_api, settings, url="https://dual.example.com/", timeout_seconds=2)
+    assert outcome.status == HealthStatus.UP
+    assert [r.url.host for r in mock_api.requests] == ["93.184.216.37", "2606:4700::1111"]
+    # The connect timeout is shared between the two addresses.
+    assert mock_api.requests[0].extensions["timeout"]["connect"] == 1.0
+
+
+async def test_deeply_nested_json_is_a_warning(mock_api: MockAPI, settings: Settings) -> None:
+    mock_api.respond(200, content=b"[" * 100_000 + b"]" * 100_000)
+    outcome = await check(mock_api, settings, inspect_json=True)
+    assert outcome.status == HealthStatus.UP
+    assert outcome.error_category == "invalid_json"
+    assert "nested too deeply" in outcome.error_message
+
+
+async def test_compressed_body_is_inflated_within_the_limit(
+    mock_api: MockAPI, settings: Settings
+) -> None:
+    bomb = gzip.compress(b"0" * (5 * 1024 * 1024))  # ~5 KB on the wire, 5 MiB inflated
+    mock_api.handler = lambda request: httpx.Response(
+        200, headers={"Content-Encoding": "gzip"}, stream=ChunkedStream([bomb])
+    )
+    outcome = await check(mock_api, settings, inspect_json=True)
+    assert outcome.status == HealthStatus.UP
+    assert outcome.error_category == "response_too_large"
+
+    small = gzip.compress(json.dumps({"id": 1}).encode())
+    mock_api.handler = lambda request: httpx.Response(
+        200, headers={"Content-Encoding": "gzip"}, stream=ChunkedStream([small])
+    )
+    outcome = await check(mock_api, settings, inspect_json=True)
+    assert outcome.json_fields == {"id": "number"}
+
+
+async def test_body_read_error_does_not_change_health(
+    mock_api: MockAPI, settings: Settings
+) -> None:
+    mock_api.handler = lambda request: httpx.Response(
+        200,
+        stream=ChunkedStream(
+            [b'{"id": 1, '], httpx.RemoteProtocolError("peer closed connection early")
+        ),
+    )
+    outcome = await check(mock_api, settings, inspect_json=True)
+    assert (outcome.status, outcome.status_code) == (HealthStatus.UP, 200)
+    assert outcome.response_time_ms is not None
+    assert outcome.error_category == "invalid_json"
+
+
+async def test_protocol_errors_never_store_response_content(
+    mock_api: MockAPI, settings: Settings
+) -> None:
+    leaked = 'illegal status line: bytearray(b\'{"token": "tok_live_9f8e"}\')'
+    mock_api.fail(httpx.RemoteProtocolError(leaked))
+    outcome = await check(mock_api, settings)
+    assert outcome.error_category == "request_error"
+    assert "tok_live" not in outcome.error_message
+
+
+@pytest.mark.parametrize("url", ["https://api.example.com/x\x7f", "https://i❤.ws/"])
+async def test_urls_the_client_cannot_request_are_reported(
+    mock_api: MockAPI, settings: Settings, url: str
+) -> None:
+    outcome = await check(mock_api, settings, url=url)
+    assert outcome.status == HealthStatus.DOWN
+    assert outcome.error_category == "invalid_url"
+    assert mock_api.requests == []
+
+
+async def test_network_guard_blocks_real_connections(settings: Settings) -> None:
+    # Without a mock transport the check would connect to 93.184.216.34 for real.
+    async with build_http_client() as client:
+        # anyio may wrap the guard's RuntimeError in an ExceptionGroup.
+        with pytest.raises((RuntimeError, ExceptionGroup)) as raised:
+            await run_check(make_monitor(), client, settings)
+    assert "must not use the network" in repr(raised.value)

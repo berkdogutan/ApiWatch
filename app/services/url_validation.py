@@ -4,24 +4,48 @@ Every URL is validated when a monitor is saved *and* again immediately before ea
 The check then connects to one of the exact addresses validated here (see
 ``app.services.checker``), so a DNS answer that changes between validation and connection
 cannot redirect the request to an internal address.
+
+URLs are parsed with httpx's parser, the same one that sends the request, so validation and
+request always agree on the host (including its IDNA 2008 ASCII form) and anything httpx
+cannot request is rejected when the monitor is saved.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+
+import httpx
 
 from app.config import Settings
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
+# Threads for validate_url's DNS lookups. A lookup that outlives its caller's deadline keeps
+# its thread busy, so lookups get a generous pool of their own instead of competing with
+# other work in the event loop's default executor.
+RESOLVER_POOL = ThreadPoolExecutor(max_workers=80, thread_name_prefix="apiwatch-dns")
+
 # Hostnames that must never be monitored, whatever they resolve to.
 BLOCKED_HOSTNAMES = frozenset(
     {"metadata", "metadata.google.internal", "metadata.goog", "instance-data"}
 )
-LOCALHOST_NAMES = frozenset({"localhost", "localhost.localdomain"})
+
+# IPv6 ranges that embed or translate IPv4 addresses. Blocked explicitly because whether
+# ``ipaddress`` treats them as global depends on the Python patch release
+# (6to4 only became non-global in 3.12.4).
+BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "2002::/16",  # 6to4
+        "2001::/32",  # Teredo
+        "64:ff9b::/96",  # NAT64, well-known prefix
+        "64:ff9b:1::/48",  # NAT64, local-use prefix
+        "::/96",  # IPv4-compatible (deprecated)
+    )
+)
 
 
 class UnsafeURLError(ValueError):
@@ -58,15 +82,16 @@ def _host_matches(host: str, patterns: list[str]) -> bool:
 def _classify(address: str) -> str:
     """Return 'public', 'loopback' or 'blocked' for an IP address string.
 
-    IPv4-mapped IPv6 addresses are judged by their IPv4 part. Python's ``ipaddress``
-    already treats 6to4, Teredo, NAT64 and IPv4-compatible ranges as non-global or
-    reserved, so they are blocked.
+    IPv4-mapped IPv6 addresses are judged by their IPv4 part; other IPv6 ranges that
+    embed IPv4 addresses (6to4, Teredo, NAT64, IPv4-compatible) are always blocked.
     """
     ip = ipaddress.ip_address(address.split("%", 1)[0])
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     if ip.is_loopback:
         return "loopback"
+    if any(ip in network for network in BLOCKED_NETWORKS):
+        return "blocked"
     if ip.is_global and not ip.is_multicast and not ip.is_reserved:
         return "public"
     return "blocked"
@@ -76,34 +101,38 @@ def validate_url(url: str, settings: Settings) -> ValidatedURL:
     """Validate a monitor target URL and return its hostname and allowed addresses.
 
     Rules:
-      * scheme must be ``http`` or ``https``; credentials in the URL are rejected;
+      * the URL must be one httpx can request; the scheme must be ``http`` or ``https``;
+        credentials in the URL are rejected;
       * if ``APIWATCH_ALLOWED_TARGET_HOSTS`` is set, the host must match it;
       * cloud metadata hostnames are always rejected;
       * every resolved address must be public. Loopback is accepted only when the
         development-only ``APIWATCH_ALLOW_LOCALHOST`` setting is enabled. Private
-        (RFC 1918), link-local (incl. 169.254.169.254), CGNAT, multicast and reserved
-        ranges are always rejected.
+        (RFC 1918), link-local (incl. 169.254.169.254), CGNAT, multicast, reserved and
+        IPv4-embedding IPv6 ranges are always rejected.
     """
     if len(url) > 2048:
         raise UnsafeURLError("URL is too long (max 2048 characters)")
-    if any(ch.isspace() or ord(ch) < 32 for ch in url):
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
         raise UnsafeURLError("URL must not contain whitespace or control characters")
     try:
-        parts = urlsplit(url)
-        port = parts.port
-    except ValueError as exc:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL as exc:
         raise UnsafeURLError(f"Malformed URL: {exc}") from None
 
-    scheme = parts.scheme.lower()
+    scheme = parsed.scheme
     if scheme not in ALLOWED_SCHEMES:
         raise UnsafeURLError("Only http:// and https:// URLs are allowed")
-    if parts.username or parts.password:
+    if parsed.userinfo:
         raise UnsafeURLError("Credentials in the URL are not allowed")
-    host = (parts.hostname or "").rstrip(".").lower()
+    # The ASCII (IDNA 2008) form: exactly what the request sends as Host and TLS SNI.
+    host = parsed.raw_host.decode("ascii").rstrip(".").lower()
     if not host:
         raise UnsafeURLError("URL must include a hostname")
+    port = parsed.port
     if port is None:
         port = 443 if scheme == "https" else 80
+    elif not 1 <= port <= 65535:
+        raise UnsafeURLError(f"Invalid port {port}")
 
     allowlist = settings.allowed_target_hosts
     if allowlist and not _host_matches(host, allowlist):
@@ -114,13 +143,10 @@ def validate_url(url: str, settings: Settings) -> ValidatedURL:
     try:
         addresses = [str(ipaddress.ip_address(host))]
     except ValueError:
-        if host in LOCALHOST_NAMES:
-            addresses = ["127.0.0.1"]
-        else:
-            try:
-                addresses = resolve_host(host, port)
-            except (OSError, UnicodeError):
-                raise DNSResolutionError(f"Could not resolve host '{host}'") from None
+        try:
+            addresses = resolve_host(host, port)
+        except (OSError, UnicodeError):
+            raise DNSResolutionError(f"Could not resolve host '{host}'") from None
     if not addresses:
         raise DNSResolutionError(f"Could not resolve host '{host}'")
 

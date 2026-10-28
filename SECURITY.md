@@ -38,18 +38,23 @@ APIWatch is a **single-user application for local use**:
 
 - **Outbound requests:**
   - only `http` and `https`, with no credentials in URLs and no redirects followed;
+  - URLs are parsed by the same parser that sends the request, and international host
+    names are resolved by their IDNA 2008 name, the one sent as `Host` and TLS SNI;
   - every resolved address must be public, which rules out loopback, private,
-    link-local/metadata, CGNAT, multicast, reserved and IPv6 transition ranges;
+    link-local/metadata, CGNAT, multicast, reserved and IPv6 transition ranges (listed
+    explicitly, independent of the Python version);
   - targets are re-validated before each check, and the request connects to the
     validated address;
-  - proxy settings and `.netrc` are ignored;
-  - responses are read only up to a size limit, and the timeout is a deadline for the
+  - cookies are never stored or sent, and proxy settings and `.netrc` are ignored;
+  - bodies are requested uncompressed and read only up to a size limit (compressed
+    bodies are inflated with the same limit), and the timeout is a deadline for the
     whole check.
 - **Requests to APIWatch:**
   - unknown `Host` headers are rejected (`APIWATCH_TRUSTED_HOSTS`);
   - cross-origin browser writes are rejected;
   - pages cannot be framed.
-- **Data:** no response bodies, authorization headers or secrets are stored. JSON change
+- **Data:** no response bodies, authorization headers or secrets are stored; error
+  messages that could quote response bytes are replaced by fixed text. JSON change
   detection keeps only top-level key names and value types.
 
 ### Known limitations (not considered vulnerabilities)

@@ -6,10 +6,11 @@
   const WINDOW_LABEL = { "24h": "last 24 hours", "7d": "last 7 days", all: "all stored data" };
   let currentWindow = "24h";
   let monitors = [];
-  let refreshing = false;
   let lastChart = null;
+  // Chart points per monitor, refetched only when the window changed or a new check arrived.
+  const chartCache = new Map();
 
-  function renderCards(stats) {
+  function renderCards(stats, w) {
     document.getElementById("card-total").textContent = stats.total_monitors;
     const extra = [];
     if (stats.paused) extra.push(`${stats.paused} paused`);
@@ -21,7 +22,7 @@
     document.getElementById("card-down-hint").textContent = stats.open_incidents ? `${stats.open_incidents} open incident${stats.open_incidents > 1 ? "s" : ""}` : "No open incidents";
     document.getElementById("card-uptime").textContent = A.formatPct(stats.checks.uptime_percentage);
     document.getElementById("card-uptime-hint").textContent = stats.checks.total_checks
-      ? `${stats.checks.successful_checks}/${stats.checks.total_checks} checks · ${WINDOW_LABEL[currentWindow]}`
+      ? `${stats.checks.successful_checks}/${stats.checks.total_checks} checks · ${WINDOW_LABEL[w]}`
       : "No checks recorded yet";
   }
 
@@ -57,31 +58,46 @@
     }).join("");
   }
 
-  async function renderChart() {
+  async function chartPoints(monitor, w) {
+    const key = `${w}|${monitor.summary.last_checked_at}`;
+    const cached = chartCache.get(monitor.id);
+    if (cached && cached.key === key) return cached.points;
+    const history = await A.api(`/api/monitors/${monitor.id}/history?window=${w}&points=240`);
+    const points = window.APIWatchChart.pointsFromResults(history.results);
+    chartCache.set(monitor.id, { key, points });
+    return points;
+  }
+
+  async function renderChart(w) {
     const container = document.getElementById("overview-chart");
     const legend = document.getElementById("overview-legend");
-    const active = monitors.filter((m) => m.summary.current_status !== "PENDING" || m.summary.last_checked_at);
+    const active = monitors.filter((m) => m.summary.last_checked_at);
+    for (const id of chartCache.keys()) {
+      if (!monitors.some((m) => m.id === id)) chartCache.delete(id);
+    }
     if (!active.length) {
       lastChart = [[], { emptyText: "Response times appear here after the first checks run." }];
       window.APIWatchChart.renderChart(container, ...lastChart);
       legend.innerHTML = "";
       return;
     }
-    const histories = await Promise.all(active.map((m) => A.api(`/api/monitors/${m.id}/history?window=${currentWindow}&points=240`)));
+    const pointLists = await Promise.all(active.map((m) => chartPoints(m, w)));
     const series = active.map((m, i) => ({
       name: m.name,
       color: PALETTE[i % PALETTE.length],
-      points: histories[i].results.map((r) => ({ t: new Date(r.checked_at), v: r.status === "DOWN" ? null : r.response_time_ms, status: r.status })),
+      points: pointLists[i],
     })).filter((s) => s.points.length);
-    lastChart = [series, { emptyText: `No checks in the ${WINDOW_LABEL[currentWindow]}.` }];
+    lastChart = [series, { emptyText: `No checks in the ${WINDOW_LABEL[w]}.` }];
     window.APIWatchChart.renderChart(container, ...lastChart);
     legend.innerHTML = series.map((s) => `<span><i style="background:${s.color}"></i>${A.escapeHtml(s.name)}</span>`).join("");
   }
 
-  function renderIncidents(incidents) {
+  function renderIncidents(incidents, openCount) {
     const list = document.getElementById("incident-list");
-    const open = incidents.filter((i) => i.is_open).length;
-    document.getElementById("incident-sub").textContent = `${open} open · ${incidents.length - open} resolved`;
+    // The list is a page of the most recent incidents; the open count comes from /api/stats.
+    document.getElementById("incident-sub").textContent = incidents.length
+      ? `${openCount} open · latest ${incidents.length} shown`
+      : "";
     if (!incidents.length) {
       list.innerHTML = `<li><div class="grow empty" style="padding:18px 0">No incidents recorded. Incidents open after ${document.getElementById("incident-sub").dataset.threshold} consecutive DOWN checks.</div></li>`;
       return;
@@ -109,27 +125,24 @@
       <td class="num">${f.status_code ?? "–"}</td></tr>`).join("");
   }
 
-  async function refresh() {
-    if (refreshing) return;
-    refreshing = true;
+  async function load() {
+    const w = currentWindow; // label everything with the window this data was fetched for
     try {
       const [stats, list, incidents, failures] = await Promise.all([
-        A.api(`/api/stats?window=${currentWindow}`),
+        A.api(`/api/stats?window=${w}`),
         A.api("/api/monitors"),
         A.api("/api/incidents?limit=20"),
         A.api("/api/failures?limit=10"),
       ]);
       monitors = list;
-      renderCards(stats);
+      renderCards(stats, w);
       renderTable();
-      renderIncidents(incidents);
+      renderIncidents(incidents, stats.open_incidents);
       renderFailures(failures);
-      await renderChart();
+      await renderChart(w);
       A.setRefreshed();
     } catch (err) {
       A.toast("Could not load dashboard data: " + err.message, "error");
-    } finally {
-      refreshing = false;
     }
   }
 
@@ -151,9 +164,7 @@
     try { await A.setEnabled(monitor, target.checked); } catch (e) { A.toast(e.message, "error"); target.checked = !target.checked; }
     refresh();
   });
-  document.addEventListener("click", (ev) => {
-    if (ev.target.closest("[data-action=add-monitor]")) A.openMonitorModal(null, refresh);
-  });
+  A.hooks.onMonitorCreated = () => refresh();
   A.bindWindowPicker((w) => { currentWindow = w; refresh(); });
 
   let resizeTimer;
@@ -164,6 +175,5 @@
     }, 150);
   });
 
-  refresh();
-  setInterval(refresh, 10000);
+  const refresh = A.poller(load, 10000);
 })();

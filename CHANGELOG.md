@@ -4,6 +4,68 @@ All notable changes to APIWatch are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Fixes from a full code review.
+
+### Fixed
+- URLs the HTTP client cannot send (for example a DEL character, `i❤.ws`, `010.0.0.1`)
+  were accepted and then crashed every check; they are now rejected when saved, and a
+  check can no longer raise for them.
+- Deeply nested JSON no longer crashes a check; it is reported as an `invalid_json`
+  warning.
+- Database work no longer runs on the event loop, and SQLite now uses WAL mode, so a slow
+  write or a long dashboard query can no longer inflate other checks' response times or
+  make them time out.
+- A check's result is discarded instead of being stored under a monitor that was edited,
+  or deleted and re-created with the same id, while the check was running.
+- Editing a monitor during its check no longer skips its next scheduled run.
+- A monitor whose host stopped resolving can be paused and edited again (`PUT` only
+  re-validates a changed URL).
+- Turning JSON inspection off no longer deletes the baseline, so changes made meanwhile
+  are reported instead of silently accepted.
+- Approving JSON changes now requires the reviewed `pending_fields` and is rejected with
+  `409` if a newer response replaced them.
+- JSON inspection with `HEAD` is rejected (HEAD responses have no body).
+- JSON numbers are a single `number` type, so `19.99` → `20` is no longer a type change.
+  Baselines saved by 1.0.0 are read accordingly.
+- Errors while reading a body for JSON inspection are warnings and no longer turn a
+  `200` into DOWN.
+- If an address does not answer within its share of the timeout, the next validated
+  address is tried.
+- `localhost` resolves to all of its loopback addresses, so servers listening only on
+  `::1` are reachable with `APIWATCH_ALLOW_LOCALHOST=true`.
+- Short outages stay visible in charts of long windows.
+- Monitors are spread over the first 30 seconds, so IDs such as 1, 11 and 21 no longer
+  start at the same instant.
+- `python -m app.database` created no tables; it now does.
+- In-memory SQLite URLs work across threads.
+- Dashboard: refreshes requested during a load are queued instead of dropped (no more
+  mislabelled windows), polling pauses in hidden tabs, unchanged chart data is not
+  refetched, the incident count comes from the server totals, the enable/disable
+  toggle starts from the server's current configuration, the JSON panel no longer
+  claims a match when the latest response could not be compared, and "Add monitor"
+  works on the 404 page.
+- Out-of-range ids return `422` instead of `500`.
+
+### Security
+- The HTTP client no longer stores cookies. Because requests are sent to pinned IP
+  addresses, a cookie set by one monitored host could be sent to another hostname on
+  the same address.
+- International host names are resolved by the same IDNA 2008 name that is sent as
+  `Host` and TLS SNI. Before, Python's IDNA 2003 encoding could pin a request to a
+  different domain's address (`straße.de` → `strasse.de`).
+- Protocol and decoding errors no longer store text that can quote response bytes.
+- Response bodies are requested uncompressed and read raw, so `max_response_bytes`
+  limits what is decompressed as well.
+- IPv6 ranges that embed IPv4 addresses (6to4, Teredo, NAT64, IPv4-compatible) are
+  blocked explicitly; on Python 3.12.0–3.12.3, 6to4 counted as public.
+- DNS lookups run in a dedicated thread pool, so hung lookups cannot starve other work.
+
+### Tests
+- 128 tests (previously 95). The network guard now also blocks asyncio connections to
+  IP literals, and `APIWATCH_*` variables from the shell no longer affect the suite.
+
 ## [1.0.0] - 2026-10-27
 
 First public release.

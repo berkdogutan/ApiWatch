@@ -8,8 +8,8 @@ from app.schemas.common import UTCDateTime
 
 MIN_INTERVAL_SECONDS = 30
 MAX_INTERVAL_SECONDS = 3600
+MAX_TIMEOUT_SECONDS = 30
 
-# Field constraints shared by create (with defaults) and update (all required).
 Name = Annotated[str, Field(min_length=1, max_length=100, examples=["Payments API"])]
 URL = Annotated[
     str, Field(min_length=1, max_length=2048, examples=["https://api.example.com/health"])
@@ -17,23 +17,23 @@ URL = Annotated[
 Method = Literal["GET", "HEAD"]
 ExpectedStatus = Annotated[int, Field(ge=100, le=599)]
 IntervalSeconds = Annotated[int, Field(ge=MIN_INTERVAL_SECONDS, le=MAX_INTERVAL_SECONDS)]
-TimeoutSeconds = Annotated[float, Field(gt=0, le=30)]
+TimeoutSeconds = Annotated[float, Field(gt=0, le=MAX_TIMEOUT_SECONDS)]
 SlowThresholdMs = Annotated[int, Field(ge=1, le=60_000)]
 InspectJson = Annotated[bool, Field(description="Track top-level JSON keys/types (GET only).")]
 
 
 class MonitorFields(BaseModel):
-    """Validation shared by every monitor payload."""
+    """Every monitor field with its constraints, shared by requests and responses."""
 
-    name: str
-    url: str
+    name: Name
+    url: URL
     method: Method
-    expected_status: int
-    interval_seconds: int
-    timeout_seconds: float
-    slow_threshold_ms: int
+    expected_status: ExpectedStatus
+    interval_seconds: IntervalSeconds
+    timeout_seconds: TimeoutSeconds
+    slow_threshold_ms: SlowThresholdMs
     enabled: bool
-    inspect_json: bool
+    inspect_json: InspectJson
 
     @field_validator("name", "url")
     @classmethod
@@ -48,18 +48,23 @@ class MonitorFields(BaseModel):
     def _upper(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
 
+
+class MonitorInput(MonitorFields):
+    """Rules that combine fields. They apply to create and update only, so monitors saved
+    by an earlier version can always be read back."""
+
     @model_validator(mode="after")
-    def _timeout_below_interval(self) -> MonitorFields:
+    def _check_combinations(self) -> MonitorInput:
         if self.timeout_seconds >= self.interval_seconds:
             raise ValueError("timeout_seconds must be shorter than interval_seconds")
+        if self.inspect_json and self.method != "GET":
+            raise ValueError("inspect_json requires the GET method (HEAD responses have no body)")
         return self
 
 
-class MonitorCreate(MonitorFields):
+class MonitorCreate(MonitorInput):
     """``POST /api/monitors``: only ``name`` and ``url`` are required."""
 
-    name: Name
-    url: URL
     method: Method = "GET"
     expected_status: ExpectedStatus = 200
     interval_seconds: IntervalSeconds = 60
@@ -69,19 +74,9 @@ class MonitorCreate(MonitorFields):
     inspect_json: InspectJson = False
 
 
-class MonitorUpdate(MonitorFields):
+class MonitorUpdate(MonitorInput):
     """``PUT /api/monitors/{id}`` replaces the whole configuration, so every field is
     required; an omitted field is an error rather than a silent reset to its default."""
-
-    name: Name
-    url: URL
-    method: Method
-    expected_status: ExpectedStatus
-    interval_seconds: IntervalSeconds
-    timeout_seconds: TimeoutSeconds
-    slow_threshold_ms: SlowThresholdMs
-    enabled: bool
-    inspect_json: InspectJson
 
 
 class MonitorSummary(BaseModel):
@@ -95,7 +90,7 @@ class MonitorSummary(BaseModel):
     next_check_at: UTCDateTime | None = None
 
 
-class MonitorRead(MonitorCreate):
+class MonitorRead(MonitorFields):
     model_config = ConfigDict(from_attributes=True)
 
     id: int

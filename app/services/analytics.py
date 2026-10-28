@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from sqlalchemy import ColumnElement, Select, case, func, or_, select, union
+from sqlalchemy import ColumnElement, Select, Subquery, case, func, or_, select, union
 from sqlalchemy.orm import Session
 
-from app.models import CheckResult, utcnow
+from app.models import CheckResult, Monitor, utcnow
 
 Window = Literal["24h", "7d", "all"]
 WINDOWS: dict[str, timedelta | None] = {
@@ -34,6 +34,10 @@ def _filters(window: Window, monitor_id: int | None) -> list[ColumnElement[bool]
     filters: list[ColumnElement[bool]] = []
     if monitor_id is not None:
         filters.append(CheckResult.monitor_id == monitor_id)
+    else:
+        # Always true (results are deleted with their monitor), but lets SQLite use the
+        # (monitor_id, checked_at) index instead of scanning the whole history.
+        filters.append(CheckResult.monitor_id.in_(select(Monitor.id)))
     start = window_start(window)
     if start is not None:
         filters.append(CheckResult.checked_at >= start)
@@ -86,34 +90,50 @@ def recent_results(
     return list(db.scalars(query).all())
 
 
+def _every_nth(rows: Subquery, points: int) -> Select:
+    """Ids of about ``points`` rows spread evenly over ``rows`` in time order, always
+    including the newest one."""
+    numbered = select(
+        rows.c.id,
+        func.row_number().over(order_by=(rows.c.checked_at, rows.c.id)).label("rn"),
+        func.count().over().label("total"),
+    ).subquery()
+    stride = (numbered.c.total + points - 1) // points  # ceil(total / points)
+    return select(numbered.c.id).where(
+        or_((numbered.c.rn - 1) % stride == 0, numbered.c.rn == numbered.c.total)
+    )
+
+
 def sampled_results(
     db: Session, window: Window, monitor_id: int | None, points: int
 ) -> list[CheckResult]:
     """About ``points`` results spread evenly over the window for charting, newest first.
 
-    Failed checks are sampled separately (also up to about ``points``) so short outages
-    stay visible however long the window is.
+    Outages are sampled separately: the first and last DOWN check of every run of failures
+    (up to about ``points`` of them), so even a single failed check stays visible however
+    long the window is.
     """
-    filters = _filters(window, monitor_id)
-
-    def every_nth(*extra: ColumnElement[bool]) -> Select:
-        numbered = (
-            select(
-                CheckResult.id,
-                func.row_number()
-                .over(order_by=(CheckResult.checked_at, CheckResult.id))
-                .label("rn"),
-                func.count().over().label("total"),
-            )
-            .where(*filters, *extra)
-            .subquery()
+    order = (CheckResult.checked_at, CheckResult.id)
+    rows = (
+        select(
+            CheckResult.id,
+            CheckResult.checked_at,
+            CheckResult.success,
+            func.lag(CheckResult.success).over(order_by=order).label("prev_success"),
+            func.lead(CheckResult.success).over(order_by=order).label("next_success"),
         )
-        stride = (numbered.c.total + points - 1) // points  # ceil(total / points)
-        return select(numbered.c.id).where(
-            or_((numbered.c.rn - 1) % stride == 0, numbered.c.rn == numbered.c.total)
+        .where(*_filters(window, monitor_id))
+        .subquery()
+    )
+    outage_edges = (
+        select(rows.c.id, rows.c.checked_at)
+        .where(
+            rows.c.success.is_(False),
+            or_(rows.c.prev_success.is_not(False), rows.c.next_success.is_not(False)),
         )
-
-    ids = union(every_nth(), every_nth(CheckResult.success.is_(False)))
+        .subquery()
+    )
+    ids = union(_every_nth(rows, points), _every_nth(outage_edges, points))
     query = (
         select(CheckResult)
         .where(CheckResult.id.in_(ids))

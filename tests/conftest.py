@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import socket
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -16,13 +18,17 @@ from app.services import url_validation
 # The real resolver, kept so its own behaviour can be tested with a fake getaddrinfo.
 REAL_RESOLVE_HOST = url_validation.resolve_host
 
-# Fake DNS so tests never touch the network.
+# Fake DNS so tests never touch the network. Keys are the ASCII (IDNA 2008) host names
+# that validate_url resolves.
 FAKE_DNS = {
     "api.example.com": ["93.184.216.34"],
     "status.example.org": ["93.184.216.35"],
     "internal.example.com": ["10.0.0.5"],
     "rebind.example.com": ["93.184.216.36", "127.0.0.1"],
     "dual.example.com": ["2606:4700::1111", "93.184.216.37"],
+    "localhost": ["::1", "127.0.0.1"],
+    "metadata.google.internal": ["93.184.216.99"],  # public, so only the name rule blocks it
+    "xn--strae-oqa.de": ["81.169.145.78"],  # straße.de; IDNA 2003 would look up strasse.de
 }
 
 
@@ -33,19 +39,35 @@ def fake_resolve(host: str, port: int) -> list[str]:
 
 
 @pytest.fixture(autouse=True)
+def _isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """APIWATCH_* variables from the developer's shell must not change test results."""
+    for name in list(os.environ):
+        if name.upper().startswith("APIWATCH_"):
+            monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
 def _fake_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(url_validation, "resolve_host", fake_resolve)
 
 
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail loudly if anything tries real DNS or outbound connections."""
+    """Fail loudly if anything tries real DNS or an outbound connection.
+
+    asyncio's create_connection is patched as well: checks connect to IP literals, which
+    never go through getaddrinfo.
+    """
 
     def blocked(*args, **kwargs):
         raise RuntimeError("tests must not use the network")
 
+    async def blocked_async(*args, **kwargs):
+        raise RuntimeError("tests must not use the network")
+
     monkeypatch.setattr(socket, "getaddrinfo", blocked)
     monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(asyncio.base_events.BaseEventLoop, "create_connection", blocked_async)
 
 
 @pytest.fixture
@@ -83,6 +105,21 @@ class MockAPI:
             raise exc
 
         self.handler = handler
+
+
+class ChunkedStream(httpx.AsyncByteStream):
+    """A response body delivered in chunks like a real network stream, optionally failing
+    part-way through."""
+
+    def __init__(self, chunks: list[bytes], error: Exception | None = None) -> None:
+        self.chunks = chunks
+        self.error = error
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.error is not None:
+            raise self.error
 
 
 @pytest.fixture

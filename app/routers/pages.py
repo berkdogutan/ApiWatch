@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app import __version__
 from app.database import get_db
 from app.models import Monitor
+from app.routers.params import MonitorId
 
 APP_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=APP_DIR / "templates")
@@ -42,7 +43,7 @@ def dashboard(request: Request) -> HTMLResponse:
 
 
 @router.get("/monitors/{monitor_id}", response_class=HTMLResponse)
-def monitor_detail(monitor_id: int, request: Request, db: Session = Depends(get_db)):
+def monitor_detail(monitor_id: MonitorId, request: Request, db: Session = Depends(get_db)):
     monitor = db.get(Monitor, monitor_id)
     if monitor is None:
         return templates.TemplateResponse(
